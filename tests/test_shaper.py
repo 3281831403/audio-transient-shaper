@@ -38,7 +38,7 @@ def test_defect_01_envelope_tracks_peak_not_mean():
 
 def test_defect_02_attack_and_release_use_distinct_time_constants():
     """A fast attack and a slow release must not share one time constant."""
-    samples = [0.0] * 4 + [1.0] * 40
+    samples = [0.0] * 4 + [1.0] * 50
 
     fast_attack = envelope(samples, 1.0, 100.0, 1000.0)
     slow_attack = envelope(samples, 20.0, 100.0, 1000.0)

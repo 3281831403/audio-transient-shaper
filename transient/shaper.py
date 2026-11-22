@@ -57,7 +57,26 @@ def envelope(
         TransientError: if ``sample_rate <= 0`` or a time constant is
             negative.
     """
-    raise NotImplementedError
+    if sample_rate <= 0:
+        raise TransientError("sample_rate must be positive")
+    if attack_ms < 0:
+        raise TransientError("attack_ms must not be negative")
+    if release_ms < 0:
+        raise TransientError("release_ms must not be negative")
+
+    attack_span = attack_ms / 1000.0 * sample_rate
+    release_span = release_ms / 1000.0 * sample_rate
+    attack_coeff = 0.0 if attack_span <= 0 else math.exp(-1.0 / attack_span)
+    release_coeff = 0.0 if release_span <= 0 else math.exp(-1.0 / release_span)
+
+    result = []
+    env = 0.0
+    for x in samples:
+        level = abs(x)
+        coeff = attack_coeff if level >= env else release_coeff
+        env = coeff * env + (1.0 - coeff) * level
+        result.append(env)
+    return result
 
 
 def detect_transients(samples: list[float], sensitivity: float) -> list[int]:
@@ -86,7 +105,29 @@ def detect_transients(samples: list[float], sensitivity: float) -> list[int]:
     Raises:
         TransientError: if ``sensitivity`` is outside ``[0, 1]``.
     """
-    raise NotImplementedError
+    if not 0.0 <= sensitivity <= 1.0:
+        raise TransientError("sensitivity must be between 0 and 1")
+    if not samples:
+        return []
+
+    peak = max(abs(x) for x in samples)
+    threshold = peak * ((1.0 - sensitivity) / 2.0)
+    threshold = max(threshold, peak * 1e-6)
+    rearm = threshold / 2.0
+
+    indices = []
+    armed = True
+    previous = abs(samples[0])
+    for i in range(1, len(samples)):
+        level = abs(samples[i])
+        if armed:
+            if level >= threshold and level > previous:
+                indices.append(i)
+                armed = False
+        elif level < rearm:
+            armed = True
+        previous = level
+    return indices
 
 
 def attack_gain(
@@ -109,7 +150,16 @@ def attack_gain(
         TransientError: if ``amount`` is outside ``[-1, 1]`` or a transient
             index is outside ``range(len(samples))``.
     """
-    raise NotImplementedError
+    if not -1.0 <= amount <= 1.0:
+        raise TransientError("amount must be between -1 and 1")
+    gains = [1.0] * len(samples)
+    for index in transients:
+        if not 0 <= index < len(samples):
+            raise TransientError(
+                f"transient index {index} is outside range({len(samples)})"
+            )
+        gains[index] = 1.0 + amount
+    return gains
 
 
 def shape_transients(
@@ -140,7 +190,20 @@ def shape_transients(
         TransientError: if ``amount`` is outside ``[-1, 1]``,
             ``width_ms <= 0``, or ``sample_rate <= 0``.
     """
-    raise NotImplementedError
+    if not -1.0 <= amount <= 1.0:
+        raise TransientError("amount must be between -1 and 1")
+    if width_ms <= 0:
+        raise TransientError("width_ms must be positive")
+    if sample_rate <= 0:
+        raise TransientError("sample_rate must be positive")
+
+    if amount == 0.0:
+        return list(samples)
+
+    transients = detect_transients(samples, 0.5)
+    gains = attack_gain(samples, transients, amount)
+    width = max(1, round(width_ms / 1000.0 * sample_rate))
+    return apply_shape(samples, gains, width)
 
 
 def soft_knee(gain: float, knee: float) -> float:
@@ -160,7 +223,13 @@ def soft_knee(gain: float, knee: float) -> float:
         TransientError: if ``knee`` is outside ``[0, 1)`` or ``gain`` is
             negative or not finite.
     """
-    raise NotImplementedError
+    if not 0.0 <= knee < 1.0:
+        raise TransientError("knee must be in [0, 1)")
+    if not math.isfinite(gain) or gain < 0.0:
+        raise TransientError("gain must be a non-negative finite number")
+    if gain <= knee:
+        return gain
+    return knee + (1.0 - knee) * math.tanh((gain - knee) / (1.0 - knee))
 
 
 def apply_shape(
@@ -192,7 +261,27 @@ def apply_shape(
         TransientError: if the lists have different lengths, ``width < 1``,
             or a gain is not finite.
     """
-    raise NotImplementedError
+    if len(samples) != len(gains):
+        raise TransientError("samples and gains must have the same length")
+    if width < 1:
+        raise TransientError("width must be at least 1")
+    for gain in gains:
+        if not math.isfinite(gain):
+            raise TransientError("gains must be finite")
+
+    count = len(samples)
+    expanded = [1.0] * count
+    for index, gain in enumerate(gains):
+        if gain == 1.0:
+            continue
+        start = index - (width - 1) // 2
+        stop = index + width // 2 + 1
+        for j in range(max(0, start), min(count, stop)):
+            expanded[j] = gain
+
+    return [
+        max(-1.0, min(1.0, samples[i] * expanded[i])) for i in range(count)
+    ]
 
 
 def validate(samples: list[float], sensitivity: float, amount: float) -> list[str]:
@@ -215,7 +304,14 @@ def validate(samples: list[float], sensitivity: float, amount: float) -> list[st
     This function only reports problems; it never raises for these three
     conditions.
     """
-    raise NotImplementedError
+    issues = []
+    if not samples:
+        issues.append("samples must not be empty")
+    if not 0.0 <= sensitivity <= 1.0:
+        issues.append("sensitivity must be between 0 and 1")
+    if not -1.0 <= amount <= 1.0:
+        issues.append("amount must be between -1 and 1")
+    return issues
 
 
 def shape_batch(tracks: list[list[float]], config: dict) -> dict:
@@ -253,4 +349,46 @@ def shape_batch(tracks: list[list[float]], config: dict) -> dict:
             malformed track, non-finite sample data, or any underlying
             transient-shaping error.
     """
-    raise NotImplementedError
+    missing = [
+        key
+        for key in ("amount", "width_ms", "sample_rate", "sensitivity")
+        if key not in config
+    ]
+    if missing:
+        raise TransientError(f"missing config values: {', '.join(missing)}")
+
+    amount = config["amount"]
+    width_ms = config["width_ms"]
+    sample_rate = config["sample_rate"]
+    sensitivity = config["sensitivity"]
+
+    if not -1.0 <= amount <= 1.0:
+        raise TransientError("amount must be between -1 and 1")
+    if width_ms <= 0:
+        raise TransientError("width_ms must be positive")
+    if sample_rate <= 0:
+        raise TransientError("sample_rate must be positive")
+    if not 0.0 <= sensitivity <= 1.0:
+        raise TransientError("sensitivity must be between 0 and 1")
+
+    for track in tracks:
+        if not track:
+            raise TransientError("each track must be a non-empty list")
+        for sample in track:
+            if not isinstance(sample, (int, float)) or not math.isfinite(sample):
+                raise TransientError("tracks must contain only finite floats")
+
+    width = max(1, round(width_ms / 1000.0 * sample_rate))
+    shaped_tracks = []
+    for track in tracks:
+        transients = detect_transients(track, sensitivity)
+        gains = attack_gain(track, transients, amount)
+        shaped_tracks.append(apply_shape(track, gains, width))
+
+    return {
+        "tracks": shaped_tracks,
+        "amount": amount,
+        "width_ms": width_ms,
+        "sample_rate": sample_rate,
+        "sensitivity": sensitivity,
+    }
